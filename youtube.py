@@ -5,6 +5,8 @@ from pytube.exceptions import VideoUnavailable, PytubeError
 import tempfile
 import threading
 import logging
+import json
+from telebot import types
 
 # --- Setup and Configuration ---
 
@@ -14,9 +16,6 @@ logger = logging.getLogger(__name__)
 
 # It's crucial to use environment variables for sensitive data like API tokens.
 # When you deploy to Render, you will set this token in the environment variables.
-# For local testing, you can uncomment the line below and replace 'YOUR_BOT_TOKEN' with your actual token.
-# os.environ['BOT_TOKEN'] = 'YOUR_BOT_TOKEN' 
-
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
 if not BOT_TOKEN:
@@ -26,33 +25,22 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- Helper Functions ---
 
-def download_audio_and_send(chat_id, query):
+def download_audio_and_send(chat_id, video_url, message_id):
     """
-    Handles the entire process of searching, downloading, and sending the audio.
+    Handles the entire process of downloading and sending the audio for a specific video.
     This function is run in a separate thread to prevent the main bot loop from blocking.
     """
-    logger.info(f"User {chat_id} requested audio for: {query}")
     processing_message = None
     temp_filepath = None
     try:
         # Send a "typing" action and a message to the user to indicate processing
         bot.send_chat_action(chat_id, 'typing')
-        processing_message = bot.send_message(chat_id, "Searching for your song on YouTube...")
+        processing_message = bot.edit_message_text("Getting audio for your selected song...", chat_id, message_id)
 
-        # Search for the video
-        search_results = Search(query).results
-        
-        if not search_results:
-            bot.edit_message_text("Sorry, I couldn't find any results for that query.", chat_id, processing_message.message_id)
-            logger.warning(f"No search results found for query: {query}")
-            return
+        # Get the video object from the URL
+        video = Search(video_url).results[0]
+        logger.info(f"Downloading audio for: {video.title} ({video.watch_url})")
 
-        video = search_results[0]
-        logger.info(f"Found video: {video.title} ({video.watch_url})")
-        
-        # Update the processing message with the video title
-        bot.edit_message_text(f"Found it! Getting audio for: *{video.title}*.", chat_id, processing_message.message_id, parse_mode='Markdown')
-        
         # Get the audio stream with the highest bitrate
         audio_stream = video.streams.filter(only_audio=True).order_by('bitrate').desc().first()
         
@@ -78,18 +66,12 @@ def download_audio_and_send(chat_id, query):
     except (PytubeError, VideoUnavailable) as e:
         error_message = f"YouTube error occurred: {e}"
         logger.error(error_message)
-        if processing_message:
-            bot.edit_message_text(f"Sorry, a YouTube-related error occurred while processing your request: {e}", chat_id, processing_message.message_id)
-        else:
-            bot.send_message(chat_id, f"Sorry, a YouTube-related error occurred while processing your request: {e}")
+        bot.edit_message_text(f"Sorry, a YouTube-related error occurred while processing your request: {e}", chat_id, message_id)
             
     except Exception as e:
         error_message = f"An unexpected error occurred: {e}"
         logger.error(error_message)
-        if processing_message:
-            bot.edit_message_text("An unexpected error occurred while processing your request. The developer has been notified.", chat_id, processing_message.message_id)
-        else:
-            bot.send_message(chat_id, "An unexpected error occurred while processing your request. The developer has been notified.")
+        bot.edit_message_text("An unexpected error occurred while processing your request. The developer has been notified.", chat_id, message_id)
             
     finally:
         # Clean up the temporary file
@@ -97,27 +79,70 @@ def download_audio_and_send(chat_id, query):
             os.remove(temp_filepath)
             logger.info(f"Deleted temporary file: {temp_filepath}")
 
-# --- Bot Command Handlers ---
+# --- Bot Command Handers ---
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     """Handles the /start and /help commands."""
     help_text = (
         "Hello! I am a YouTube Music Bot.\n"
-        "Just send me the name of a song or artist, and I'll send you the audio.\n\n"
-        "Example: *Rema Calm Down*\n\n"
-        "Note: I'll search for the top result on YouTube and download the highest quality audio stream."
+        "Just send me the name of a song or artist, and I'll give you a list of results to choose from."
     )
-    bot.reply_to(message, help_text, parse_mode='Markdown')
+    bot.reply_to(message, help_text)
 
 # --- Main Message Handler ---
 
 @bot.message_handler(content_types=['text'])
 def handle_text_message(message):
-    """Handles all text messages and initiates the audio download process."""
-    if len(message.text.strip()) > 0:
+    """Handles all text messages and presents search results as buttons."""
+    query = message.text.strip()
+    if len(query) > 0:
+        bot.send_chat_action(message.chat.id, 'typing')
+        processing_message = bot.send_message(message.chat.id, "Searching for your song on YouTube...")
+        
+        try:
+            search_results = Search(query).results
+            if not search_results:
+                bot.edit_message_text("Sorry, I couldn't find any results for that query.", message.chat.id, processing_message.message_id)
+                logger.warning(f"No search results found for query: {query}")
+                return
+
+            keyboard = types.InlineKeyboardMarkup()
+            for i, video in enumerate(search_results[:5]):  # Show top 5 results
+                # Use a dictionary to store both the URL and a new message_id
+                # This is necessary because we need the message ID to edit it later
+                callback_data = json.dumps({'url': video.watch_url, 'message_id': processing_message.message_id})
+                keyboard.add(types.InlineKeyboardButton(f"🎧 {video.title}", callback_data=callback_data))
+
+            bot.edit_message_text("Please choose a song:", message.chat.id, processing_message.message_id, reply_markup=keyboard)
+
+        except Exception as e:
+            logger.error(f"Error during search: {e}")
+            bot.edit_message_text("An error occurred during the search. Please try again.", message.chat.id, processing_message.message_id)
+
+# --- Callback Query Handler (for button clicks) ---
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback_query(call):
+    """Handles button clicks and initiates the download."""
+    try:
+        data = json.loads(call.data)
+        video_url = data['url']
+        message_id = data['message_id']
+        
+        # Respond to the callback query to remove the loading clock
+        bot.answer_callback_query(call.id, text="Downloading...")
+        
         # Start the download process in a new thread
-        threading.Thread(target=download_audio_and_send, args=(message.chat.id, message.text)).start()
+        threading.Thread(target=download_audio_and_send, args=(call.message.chat.id, video_url, message_id)).start()
+        
+    except json.JSONDecodeError:
+        logger.error(f"Invalid callback data: {call.data}")
+        bot.answer_callback_query(call.id, text="Error: Invalid button data.")
+    except Exception as e:
+        logger.error(f"Error handling callback: {e}")
+        bot.answer_callback_query(call.id, text="An unexpected error occurred.")
+
 
 # --- Main Bot Loop ---
 
