@@ -1,7 +1,7 @@
 import os
 import telebot
 from pytube import Search
-from pytube.exceptions import VideoUnavailable
+from pytube.exceptions import VideoUnavailable, PytubeError
 import tempfile
 import threading
 import logging
@@ -32,6 +32,8 @@ def download_audio_and_send(chat_id, query):
     This function is run in a separate thread to prevent the main bot loop from blocking.
     """
     logger.info(f"User {chat_id} requested audio for: {query}")
+    processing_message = None
+    temp_filepath = None
     try:
         # Send a "typing" action and a message to the user to indicate processing
         bot.send_chat_action(chat_id, 'typing')
@@ -42,9 +44,11 @@ def download_audio_and_send(chat_id, query):
         
         if not search_results:
             bot.edit_message_text("Sorry, I couldn't find any results for that query.", chat_id, processing_message.message_id)
+            logger.warning(f"No search results found for query: {query}")
             return
 
         video = search_results[0]
+        logger.info(f"Found video: {video.title} ({video.watch_url})")
         
         # Update the processing message with the video title
         bot.edit_message_text(f"Found it! Getting audio for: *{video.title}*.", chat_id, processing_message.message_id, parse_mode='Markdown')
@@ -54,14 +58,16 @@ def download_audio_and_send(chat_id, query):
         
         if not audio_stream:
             bot.edit_message_text("Sorry, no audio streams found for this video.", chat_id, processing_message.message_id)
+            logger.warning(f"No audio streams found for video: {video.title}")
             return
 
         # Use a temporary file to save the audio
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
             temp_filepath = temp_file.name
         
-        # Download the audio file to the temporary path
+        logger.info(f"Starting download of audio to {temp_filepath}")
         audio_stream.download(output_path=os.path.dirname(temp_filepath), filename=os.path.basename(temp_filepath))
+        logger.info("Download completed.")
 
         # Send the audio file to the user
         with open(temp_filepath, 'rb') as audio_file:
@@ -69,14 +75,25 @@ def download_audio_and_send(chat_id, query):
             
         bot.delete_message(chat_id, processing_message.message_id)
         
-    except VideoUnavailable:
-        bot.send_message(chat_id, "Sorry, this video is unavailable.")
+    except (PytubeError, VideoUnavailable) as e:
+        error_message = f"YouTube error occurred: {e}"
+        logger.error(error_message)
+        if processing_message:
+            bot.edit_message_text(f"Sorry, a YouTube-related error occurred while processing your request: {e}", chat_id, processing_message.message_id)
+        else:
+            bot.send_message(chat_id, f"Sorry, a YouTube-related error occurred while processing your request: {e}")
+            
     except Exception as e:
-        logger.error(f"An error occurred: {e}")
-        bot.send_message(chat_id, "An unexpected error occurred while processing your request.")
+        error_message = f"An unexpected error occurred: {e}"
+        logger.error(error_message)
+        if processing_message:
+            bot.edit_message_text("An unexpected error occurred while processing your request. The developer has been notified.", chat_id, processing_message.message_id)
+        else:
+            bot.send_message(chat_id, "An unexpected error occurred while processing your request. The developer has been notified.")
+            
     finally:
         # Clean up the temporary file
-        if 'temp_filepath' in locals() and os.path.exists(temp_filepath):
+        if temp_filepath and os.path.exists(temp_filepath):
             os.remove(temp_filepath)
             logger.info(f"Deleted temporary file: {temp_filepath}")
 
